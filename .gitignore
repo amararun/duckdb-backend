@@ -13,7 +13,8 @@ __pycache__/
 venv/
 ENV/
 
-# DuckDB WAL files only (keep .duckdb files in repo)
+# DuckDB data files (stored on mounted volume, not in repo)
+data/*.duckdb
 data/*.duckdb.wal
 
 # IDE
