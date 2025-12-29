@@ -170,23 +170,28 @@ def ensure_metadata_exists():
     """Ensure metadata file exists and is up to date with actual files."""
     metadata = load_metadata()
     files_on_disk = set()
+    needs_save = False
 
     # Scan directory for .duckdb files
     for f in os.listdir(DATA_DIR):
         if f.endswith(".duckdb"):
             files_on_disk.add(f)
             filepath = os.path.join(DATA_DIR, f)
-            if f not in metadata:
-                logger.info(f"Building metadata for new file: {f}")
+            # Rebuild if file not in metadata OR if table_row_counts is missing (backward compat)
+            if f not in metadata or "table_row_counts" not in metadata[f]:
+                logger.info(f"Building/updating metadata for file: {f}")
                 metadata[f] = rebuild_metadata_for_file(f, filepath)
+                needs_save = True
 
     # Remove metadata for files that no longer exist
     for f in list(metadata.keys()):
         if f not in files_on_disk:
             logger.info(f"Removing metadata for deleted file: {f}")
             del metadata[f]
+            needs_save = True
 
-    save_metadata(metadata)
+    if needs_save:
+        save_metadata(metadata)
     return metadata
 
 # ============== Startup/Shutdown ==============
