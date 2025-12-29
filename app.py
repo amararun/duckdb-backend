@@ -84,6 +84,9 @@ class TableSchema(BaseModel):
 class RenameRequest(BaseModel):
     new_name: str
 
+class TableRenameRequest(BaseModel):
+    new_table_name: str
+
 # Initialize FastAPI
 app = FastAPI(
     title="DuckDB Cricket API",
@@ -134,41 +137,32 @@ def save_metadata(metadata: dict):
     except Exception as e:
         logger.error(f"Failed to save metadata: {e}")
 
-def get_duckdb_row_count(filepath: str) -> int:
-    """Get total row count from a DuckDB file by summing all tables."""
+def get_duckdb_table_info(filepath: str) -> tuple[List[str], dict, int]:
+    """Get list of tables, per-table row counts, and total row count from a DuckDB file."""
     try:
         conn = duckdb.connect(filepath, read_only=True)
         tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
+        table_row_counts = {}
         total_rows = 0
         for table in tables:
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            table_row_counts[table] = count
             total_rows += count
         conn.close()
-        return total_rows
+        return tables, table_row_counts, total_rows
     except Exception as e:
-        logger.error(f"Failed to count rows in {filepath}: {e}")
-        return -1
-
-def get_duckdb_tables(filepath: str) -> List[str]:
-    """Get list of tables in a DuckDB file."""
-    try:
-        conn = duckdb.connect(filepath, read_only=True)
-        tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
-        conn.close()
-        return tables
-    except Exception as e:
-        logger.error(f"Failed to get tables from {filepath}: {e}")
-        return []
+        logger.error(f"Failed to get table info from {filepath}: {e}")
+        return [], {}, -1
 
 def rebuild_metadata_for_file(filename: str, filepath: str) -> dict:
     """Build metadata entry for a single file."""
     size_bytes = os.path.getsize(filepath)
-    row_count = get_duckdb_row_count(filepath)
-    tables = get_duckdb_tables(filepath)
+    tables, table_row_counts, total_rows = get_duckdb_table_info(filepath)
     return {
         "size_bytes": size_bytes,
-        "row_count": row_count,
+        "row_count": total_rows,
         "tables": tables,
+        "table_row_counts": table_row_counts,
         "updated_at": datetime.now().isoformat()
     }
 
@@ -368,6 +362,7 @@ async def list_files(request: Request):
                 "size_mb": round(info.get("size_bytes", 0) / (1024 * 1024), 2),
                 "row_count": info.get("row_count", -1),
                 "tables": info.get("tables", []),
+                "table_row_counts": info.get("table_row_counts", {}),
                 "updated_at": info.get("updated_at", "")
             })
         # Sort by name
@@ -595,6 +590,118 @@ async def refresh_file_metadata(filename: str, request: Request):
         }
     except Exception as e:
         logger.error(f"Error refreshing metadata for {filename}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============== Table-level operations (within a DuckDB file) ==============
+
+@app.put("/api/v1/admin/files/{filename}/tables/{table_name}/rename", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def rename_table(filename: str, table_name: str, rename_req: TableRenameRequest, request: Request):
+    """Rename a table within a DuckDB file."""
+    new_table_name = rename_req.new_table_name
+
+    # Security: prevent path traversal and SQL injection
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    # Validate table names (alphanumeric and underscores only)
+    import re
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
+        raise HTTPException(status_code=400, detail="Invalid table name")
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', new_table_name):
+        raise HTTPException(status_code=400, detail="Invalid new table name")
+
+    filepath = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
+
+    try:
+        # Open connection in write mode
+        conn = duckdb.connect(filepath, read_only=False)
+
+        # Check if source table exists
+        tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
+        if table_name not in tables:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found in '{filename}'")
+
+        # Check if target name already exists
+        if new_table_name in tables:
+            conn.close()
+            raise HTTPException(status_code=409, detail=f"Table '{new_table_name}' already exists")
+
+        # Rename the table
+        conn.execute(f'ALTER TABLE "{table_name}" RENAME TO "{new_table_name}"')
+        conn.close()
+
+        # Update metadata
+        metadata = load_metadata()
+        metadata[filename] = rebuild_metadata_for_file(filename, filepath)
+        save_metadata(metadata)
+
+        logger.info(f"Renamed table in {filename}: {table_name} -> {new_table_name}")
+        return {
+            "message": f"Table renamed from '{table_name}' to '{new_table_name}'",
+            "filename": filename,
+            "old_table_name": table_name,
+            "new_table_name": new_table_name
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error renaming table {table_name} in {filename}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/v1/admin/files/{filename}/tables/{table_name}", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def delete_table(filename: str, table_name: str, request: Request):
+    """Delete a table from a DuckDB file."""
+    # Security: prevent path traversal and SQL injection
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    # Validate table name (alphanumeric and underscores only)
+    import re
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
+        raise HTTPException(status_code=400, detail="Invalid table name")
+
+    filepath = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
+
+    try:
+        # Open connection in write mode
+        conn = duckdb.connect(filepath, read_only=False)
+
+        # Check if table exists
+        tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
+        if table_name not in tables:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found in '{filename}'")
+
+        # Get row count before deletion for logging
+        row_count = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+
+        # Drop the table
+        conn.execute(f'DROP TABLE "{table_name}"')
+        conn.close()
+
+        # Update metadata
+        metadata = load_metadata()
+        metadata[filename] = rebuild_metadata_for_file(filename, filepath)
+        save_metadata(metadata)
+
+        logger.info(f"Deleted table {table_name} ({row_count} rows) from {filename}")
+        return {
+            "message": f"Table '{table_name}' deleted from '{filename}'",
+            "filename": filename,
+            "deleted_table": table_name,
+            "deleted_rows": row_count
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting table {table_name} from {filename}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Run with uvicorn
