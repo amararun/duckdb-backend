@@ -51,7 +51,7 @@ UPLOAD_TOKENS: dict[str, dict] = {}
 UPLOAD_TOKEN_EXPIRY = 600  # 10 minutes
 
 # Version
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # Logging setup
 logging.basicConfig(
@@ -111,13 +111,16 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONRe
         content={"detail": "Rate limit exceeded. Please try again later."}
     )
 
-# CORS
+# CORS - explicitly allow all origins for direct upload endpoint
+# The CORS_ORIGINS env var can restrict this for other endpoints
+cors_origins = CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # DuckDB connection (opened once at startup)
@@ -778,6 +781,19 @@ async def generate_upload_token(token_req: UploadTokenRequest, request: Request)
         "upload_url": f"/api/v1/admin/upload-direct/{token}",
         "max_size_mb": MAX_UPLOAD_SIZE // (1024 * 1024)
     }
+
+
+@app.options("/api/v1/admin/upload-direct/{token}")
+async def upload_direct_options(token: str):
+    """Handle CORS preflight for direct upload endpoint."""
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 
 @app.post("/api/v1/admin/upload-direct/{token}")
