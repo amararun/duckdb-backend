@@ -24,6 +24,8 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
+import hashlib
+import time as time_module
 
 # Load environment variables
 load_dotenv()
@@ -44,8 +46,12 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 # Metadata file for caching file info
 METADATA_FILE = os.path.join(DATA_DIR, "file_metadata.json")
 
+# Upload token storage (in-memory, tokens expire after 10 minutes)
+UPLOAD_TOKENS: dict[str, dict] = {}
+UPLOAD_TOKEN_EXPIRY = 600  # 10 minutes
+
 # Version
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Logging setup
 logging.basicConfig(
@@ -708,6 +714,150 @@ async def delete_table(filename: str, table_name: str, request: Request):
     except Exception as e:
         logger.error(f"Error deleting table {table_name} from {filename}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== Direct Upload with Token ==============
+
+def cleanup_expired_tokens():
+    """Remove expired tokens from storage."""
+    current_time = time_module.time()
+    expired = [token for token, data in UPLOAD_TOKENS.items()
+               if current_time > data["expires_at"]]
+    for token in expired:
+        del UPLOAD_TOKENS[token]
+
+
+class UploadTokenRequest(BaseModel):
+    filename: str
+    content_length: Optional[int] = None
+
+
+@app.post("/api/v1/admin/upload-token", dependencies=[Depends(verify_api_key)])
+@limiter.limit("20/hour")
+async def generate_upload_token(token_req: UploadTokenRequest, request: Request):
+    """
+    Generate a temporary upload token for direct file upload.
+    This allows bypassing the Vercel proxy for large files.
+    """
+    cleanup_expired_tokens()
+
+    filename = token_req.filename
+
+    # Security: prevent path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    # Ensure .duckdb extension
+    if not filename.endswith(".duckdb"):
+        filename = filename + ".duckdb"
+
+    # Check file size limit
+    if token_req.content_length and token_req.content_length > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Max size: {MAX_UPLOAD_SIZE // (1024*1024)}MB"
+        )
+
+    # Generate secure token
+    token = secrets.token_urlsafe(32)
+    expires_at = time_module.time() + UPLOAD_TOKEN_EXPIRY
+
+    UPLOAD_TOKENS[token] = {
+        "filename": filename,
+        "content_length": token_req.content_length,
+        "expires_at": expires_at,
+        "created_at": time_module.time()
+    }
+
+    logger.info(f"Generated upload token for: {filename}")
+
+    return {
+        "token": token,
+        "filename": filename,
+        "expires_in": UPLOAD_TOKEN_EXPIRY,
+        "upload_url": f"/api/v1/admin/upload-direct/{token}",
+        "max_size_mb": MAX_UPLOAD_SIZE // (1024 * 1024)
+    }
+
+
+@app.post("/api/v1/admin/upload-direct/{token}")
+@limiter.limit("10/hour")
+async def upload_direct(token: str, request: Request, file: UploadFile = File(...)):
+    """
+    Direct file upload using a pre-generated token.
+    No API key required - the token itself is the authorization.
+    """
+    cleanup_expired_tokens()
+
+    # Verify token
+    if token not in UPLOAD_TOKENS:
+        raise HTTPException(status_code=401, detail="Invalid or expired upload token")
+
+    token_data = UPLOAD_TOKENS[token]
+
+    # Check expiry
+    if time_module.time() > token_data["expires_at"]:
+        del UPLOAD_TOKENS[token]
+        raise HTTPException(status_code=401, detail="Upload token has expired")
+
+    filename = token_data["filename"]
+    filepath = os.path.join(DATA_DIR, filename)
+
+    try:
+        # Save file with size limit check
+        total_size = 0
+        with open(filepath, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1MB chunks
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_SIZE:
+                    f.close()
+                    os.remove(filepath)
+                    del UPLOAD_TOKENS[token]
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Max size: {MAX_UPLOAD_SIZE // (1024*1024)}MB"
+                    )
+                f.write(chunk)
+
+        # Validate it is a valid DuckDB file
+        try:
+            test_conn = duckdb.connect(filepath, read_only=True)
+            test_conn.execute("SHOW TABLES")
+            test_conn.close()
+        except Exception as e:
+            os.remove(filepath)
+            del UPLOAD_TOKENS[token]
+            raise HTTPException(status_code=400, detail=f"Invalid DuckDB file: {str(e)}")
+
+        # Update metadata
+        metadata = load_metadata()
+        metadata[filename] = rebuild_metadata_for_file(filename, filepath)
+        save_metadata(metadata)
+
+        # Consume the token (one-time use)
+        del UPLOAD_TOKENS[token]
+
+        logger.info(f"Direct upload completed: {filename} ({total_size} bytes)")
+        return {
+            "message": "File uploaded successfully",
+            "filename": filename,
+            "size_bytes": total_size,
+            "size_mb": round(total_size / (1024 * 1024), 2)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Cleanup on error
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        if token in UPLOAD_TOKENS:
+            del UPLOAD_TOKENS[token]
+        logger.error(f"Error in direct upload: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Run with uvicorn
 if __name__ == "__main__":
