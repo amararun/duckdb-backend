@@ -35,7 +35,7 @@ API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY environment variable not set")
 
-DATA_PATH = os.getenv("DATA_PATH", "./data/odi_t20.duckdb")
+DATA_PATH = os.getenv("DATA_PATH", "./data/cricket.duckdb")
 DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(DATA_PATH) or "./data")
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))  # 500MB default
 RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
