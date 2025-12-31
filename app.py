@@ -51,7 +51,7 @@ UPLOAD_TOKENS: dict[str, dict] = {}
 UPLOAD_TOKEN_EXPIRY = 600  # 10 minutes
 
 # Version
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 # Logging setup
 logging.basicConfig(
@@ -108,7 +108,12 @@ app.state.limiter = limiter
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     return JSONResponse(
         status_code=HTTP_429_TOO_MANY_REQUESTS,
-        content={"detail": "Rate limit exceeded. Please try again later."}
+        content={"detail": "Rate limit exceeded. Please try again later."},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
     )
 
 # CORS - explicitly allow all origins for direct upload endpoint
@@ -796,9 +801,26 @@ async def upload_direct_options(token: str):
     )
 
 
+def cors_json_response(content: dict, status_code: int = 200) -> JSONResponse:
+    """Return JSONResponse with CORS headers."""
+    return JSONResponse(
+        content=content,
+        status_code=status_code,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+
 @app.post("/api/v1/admin/upload-direct/{token}")
-@limiter.limit("10/hour")
-async def upload_direct(token: str, request: Request, file: UploadFile = File(...)):
+@limiter.limit("20/hour")  # Generous limit since tokens are already rate-limited
+async def upload_direct(
+    token: str,
+    request: Request,
+    file: UploadFile = File(...)
+):
     """
     Direct file upload using a pre-generated token.
     No API key required - the token itself is the authorization.
@@ -807,14 +829,14 @@ async def upload_direct(token: str, request: Request, file: UploadFile = File(..
 
     # Verify token
     if token not in UPLOAD_TOKENS:
-        raise HTTPException(status_code=401, detail="Invalid or expired upload token")
+        return cors_json_response({"detail": "Invalid or expired upload token"}, 401)
 
     token_data = UPLOAD_TOKENS[token]
 
     # Check expiry
     if time_module.time() > token_data["expires_at"]:
         del UPLOAD_TOKENS[token]
-        raise HTTPException(status_code=401, detail="Upload token has expired")
+        return cors_json_response({"detail": "Upload token has expired"}, 401)
 
     filename = token_data["filename"]
     filepath = os.path.join(DATA_DIR, filename)
@@ -832,9 +854,9 @@ async def upload_direct(token: str, request: Request, file: UploadFile = File(..
                     f.close()
                     os.remove(filepath)
                     del UPLOAD_TOKENS[token]
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"File too large. Max size: {MAX_UPLOAD_SIZE // (1024*1024)}MB"
+                    return cors_json_response(
+                        {"detail": f"File too large. Max size: {MAX_UPLOAD_SIZE // (1024*1024)}MB"},
+                        413
                     )
                 f.write(chunk)
 
@@ -846,7 +868,7 @@ async def upload_direct(token: str, request: Request, file: UploadFile = File(..
         except Exception as e:
             os.remove(filepath)
             del UPLOAD_TOKENS[token]
-            raise HTTPException(status_code=400, detail=f"Invalid DuckDB file: {str(e)}")
+            return cors_json_response({"detail": f"Invalid DuckDB file: {str(e)}"}, 400)
 
         # Update metadata
         metadata = load_metadata()
@@ -857,14 +879,12 @@ async def upload_direct(token: str, request: Request, file: UploadFile = File(..
         del UPLOAD_TOKENS[token]
 
         logger.info(f"Direct upload completed: {filename} ({total_size} bytes)")
-        return {
+        return cors_json_response({
             "message": "File uploaded successfully",
             "filename": filename,
             "size_bytes": total_size,
             "size_mb": round(total_size / (1024 * 1024), 2)
-        }
-    except HTTPException:
-        raise
+        })
     except Exception as e:
         # Cleanup on error
         if os.path.exists(filepath):
@@ -872,7 +892,7 @@ async def upload_direct(token: str, request: Request, file: UploadFile = File(..
         if token in UPLOAD_TOKENS:
             del UPLOAD_TOKENS[token]
         logger.error(f"Error in direct upload: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return cors_json_response({"detail": str(e)}, 500)
 
 
 # Run with uvicorn
