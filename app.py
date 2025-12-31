@@ -51,7 +51,10 @@ UPLOAD_TOKENS: dict[str, dict] = {}
 UPLOAD_TOKEN_EXPIRY = 600  # 10 minutes
 
 # Version
-VERSION = "1.2.2"
+VERSION = "1.2.3"
+
+# Share tokens file for persistent storage
+SHARE_TOKENS_FILE = os.path.join(DATA_DIR, "share_tokens.json")
 
 # Logging setup
 logging.basicConfig(
@@ -207,6 +210,41 @@ def ensure_metadata_exists():
     if needs_save:
         save_metadata(metadata)
     return metadata
+
+# ============== Share Token helpers ==============
+
+def load_share_tokens() -> dict:
+    """Load share tokens from JSON file, or return empty dict if not exists."""
+    if os.path.exists(SHARE_TOKENS_FILE):
+        try:
+            with open(SHARE_TOKENS_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load share tokens: {e}")
+    return {}
+
+def save_share_tokens(tokens: dict):
+    """Save share tokens to JSON file."""
+    try:
+        with open(SHARE_TOKENS_FILE, "w") as f:
+            json.dump(tokens, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save share tokens: {e}")
+
+def get_share_token_for_file(filename: str) -> Optional[str]:
+    """Get share token for a file if it exists."""
+    tokens = load_share_tokens()
+    for token, data in tokens.items():
+        if data.get("filename") == filename:
+            return token
+    return None
+
+def get_file_for_share_token(token: str) -> Optional[str]:
+    """Get filename for a share token if it exists."""
+    tokens = load_share_tokens()
+    if token in tokens:
+        return tokens[token].get("filename")
+    return None
 
 # ============== Startup/Shutdown ==============
 
@@ -375,6 +413,7 @@ async def list_files(request: Request):
         metadata = ensure_metadata_exists()
         files = []
         for filename, info in metadata.items():
+            share_token = get_share_token_for_file(filename)
             files.append({
                 "name": filename,
                 "size_bytes": info.get("size_bytes", 0),
@@ -382,7 +421,8 @@ async def list_files(request: Request):
                 "row_count": info.get("row_count", -1),
                 "tables": info.get("tables", []),
                 "table_row_counts": info.get("table_row_counts", {}),
-                "updated_at": info.get("updated_at", "")
+                "updated_at": info.get("updated_at", ""),
+                "share_token": share_token
             })
         # Sort by name
         files.sort(key=lambda x: x["name"])
@@ -893,6 +933,106 @@ async def upload_direct(
             del UPLOAD_TOKENS[token]
         logger.error(f"Error in direct upload: {e}")
         return cors_json_response({"detail": str(e)}, 500)
+
+
+# ============== File Sharing ==============
+
+@app.post("/api/v1/admin/files/{filename}/share", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def share_file(filename: str, request: Request):
+    """
+    Create a shareable link for a file.
+    Returns the share token which can be used to download the file without authentication.
+    """
+    # Security: prevent path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    filepath = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
+
+    # Check if already shared
+    existing_token = get_share_token_for_file(filename)
+    if existing_token:
+        return {
+            "message": "File is already shared",
+            "token": existing_token,
+            "share_url": f"/s/{existing_token}",
+            "filename": filename
+        }
+
+    # Generate new share token
+    token = secrets.token_urlsafe(16)  # Shorter token for share URLs
+
+    tokens = load_share_tokens()
+    tokens[token] = {
+        "filename": filename,
+        "created_at": datetime.now().isoformat()
+    }
+    save_share_tokens(tokens)
+
+    logger.info(f"Created share link for: {filename}")
+    return {
+        "message": "Share link created",
+        "token": token,
+        "share_url": f"/s/{token}",
+        "filename": filename
+    }
+
+
+@app.delete("/api/v1/admin/files/{filename}/share", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def unshare_file(filename: str, request: Request):
+    """
+    Remove the shareable link for a file.
+    """
+    # Security: prevent path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    # Find and remove the share token
+    token = get_share_token_for_file(filename)
+    if not token:
+        raise HTTPException(status_code=404, detail=f"File '{filename}' is not shared")
+
+    tokens = load_share_tokens()
+    del tokens[token]
+    save_share_tokens(tokens)
+
+    logger.info(f"Removed share link for: {filename}")
+    return {
+        "message": "Share link removed",
+        "filename": filename
+    }
+
+
+@app.get("/s/{token}")
+@limiter.limit("100/hour")
+async def download_shared_file(token: str, request: Request):
+    """
+    Download a file using a share token.
+    No authentication required - the token is the authorization.
+    """
+    filename = get_file_for_share_token(token)
+    if not filename:
+        raise HTTPException(status_code=404, detail="Invalid or expired share link")
+
+    filepath = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(filepath):
+        # File was deleted but share token still exists - clean it up
+        tokens = load_share_tokens()
+        if token in tokens:
+            del tokens[token]
+            save_share_tokens(tokens)
+        raise HTTPException(status_code=404, detail="File no longer exists")
+
+    logger.info(f"Shared download: {filename}")
+    return FileResponse(
+        filepath,
+        media_type="application/octet-stream",
+        filename=filename
+    )
 
 
 # Run with uvicorn
