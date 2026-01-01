@@ -28,12 +28,12 @@ React Component → Vercel Proxy → Backend API
 The proxy:
 1. Receives requests from React frontend at `/api/duckdb`
 2. Adds `Authorization: Bearer {DUCKDB_BACKEND_API_KEY}` header
-3. Forwards to `https://duckdb-cricket-backend.tigzig.com`
+3. Forwards to `https://duckdb-backend.tigzig.com`
 4. Returns response to frontend
 
 **Environment Variables (Vercel):**
 ```
-DUCKDB_BACKEND_URL=https://duckdb-cricket-backend.tigzig.com
+DUCKDB_BACKEND_URL=https://duckdb-backend.tigzig.com
 DUCKDB_BACKEND_API_KEY=cricket-dashboard-2024-tigzig
 ```
 
@@ -81,7 +81,7 @@ Same proxy pattern as Cricket Dashboard.
 
 **Environment Variables (Vercel):**
 ```
-DUCKDB_BACKEND_URL=https://duckdb-cricket-backend.tigzig.com
+DUCKDB_BACKEND_URL=https://duckdb-backend.tigzig.com
 DUCKDB_BACKEND_API_KEY=cricket-dashboard-2024-tigzig
 ```
 

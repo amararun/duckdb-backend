@@ -20,7 +20,7 @@ DuckDB Files (/data/*.duckdb)
 
 - **GitHub:** `https://github.com/amararun/duckdb-backend`
 - **Local:** `C:\AMARDATA\GITHUB\DUCKDB_BACKEND`
-- **Backend URL:** `https://duckdb-cricket-backend.tigzig.com`
+- **Backend URL:** `https://duckdb-backend.tigzig.com`
 - **Upload URL:** `https://duckdb-upload.tigzig.com` (bypasses Cloudflare for large files)
 - **Coolify App UUID:** `b8ogo4k4ckwcckwos8ck4c4w`
 
