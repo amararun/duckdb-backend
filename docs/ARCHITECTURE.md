@@ -1,19 +1,21 @@
 # DuckDB Backend - Architecture
 
-**Last Updated:** 2026-01-01
+**Last Updated:** 2026-01-02
 
 ## Overview
 
-A **generic FastAPI server** that provides REST API access to DuckDB databases. Not cricket-specific - can host any DuckDB files. Deployed on Hetzner VPS via Coolify, accessed through Vercel proxy.
+A **generic FastAPI server** that provides REST API access to DuckDB databases and Parquet files. Supports both master admin access and per-file API tokens with permission levels. Deployed on Hetzner VPS via Coolify.
 
 ```
-Frontend (React/Vercel)
+Admin Frontend (React/Vercel)
         ↓
-Vercel Proxy (/api/duckdb.ts)  ← Holds BACKEND_API_KEY
+Vercel Proxy (/api/duckdb.ts)  ← Holds Master API Key
         ↓
 FastAPI Backend (Hetzner/Coolify)
         ↓
-DuckDB Files (/data/*.duckdb)
+DuckDB/Parquet Files (/data/*.duckdb, *.parquet)
+
+Client Apps → Per-file API Token → FastAPI Backend
 ```
 
 ## Repository
@@ -28,7 +30,7 @@ DuckDB Files (/data/*.duckdb)
 
 ```
 DUCKDB_BACKEND/
-├── app.py              # Main FastAPI application
+├── app.py              # Main FastAPI application (~1450 lines)
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Environment variables template
 ├── README.md
@@ -36,40 +38,49 @@ DUCKDB_BACKEND/
 │   ├── ARCHITECTURE.md # This file
 │   └── CLIENTS.md      # Apps accessing this backend
 └── data/
-    ├── *.duckdb        # Database files
-    ├── file_metadata.json    # Cached file/table info
-    └── share_tokens.json     # Public share tokens
+    ├── *.duckdb        # DuckDB database files
+    ├── *.parquet       # Parquet data files
+    ├── file_metadata.json    # Cached file/table metadata
+    ├── share_tokens.json     # Public share tokens
+    └── tokens.db             # SQLite - per-file API tokens (bcrypt hashed)
 ```
 
-## Authentication
+---
 
-### API Key Authentication
+## Authentication Models
 
-All protected endpoints require Bearer token authentication:
+### 1. Master Admin Key
+
+- Stored in env var `API_KEY`
+- Full access to all admin endpoints
+- Used by admin frontend via Vercel proxy
+- Never exposed to browser
 
 ```bash
-Authorization: Bearer YOUR_API_KEY
+Authorization: Bearer YOUR_MASTER_API_KEY
 ```
 
-**Current API Key:** `cricket-dashboard-2024-tigzig`
+### 2. Per-file API Tokens
 
-### Security Implementation
+- Stored in SQLite (`data/tokens.db`) with bcrypt hashes
+- Scoped to specific file + permission level
+- Created via admin UI or API
+- Can be rotated, disabled, or have expiration
+- Raw token only shown once on creation
 
-- Uses `secrets.compare_digest()` for constant-time comparison (prevents timing attacks)
-- API key stored in environment variable `API_KEY`
-- Frontend never sees the key - Vercel proxy holds it
+**Permission Levels:**
 
-### Platform Access Credentials
+| Level | Allowed SQL Operations |
+|-------|------------------------|
+| `read` | SELECT, WITH only |
+| `write` | SELECT, WITH, INSERT, UPDATE |
+| `admin` | All except DROP DATABASE |
 
-For Clerk, Cloudflare, and other platform credentials used by AI coders:
+```bash
+Authorization: Bearer YOUR_FILE_TOKEN
+```
 
-**Location:** `C:\AMARDATA\GITHUB\RBICC_AUTH_EMBED\projects\claude-platform-access\`
-
-Files:
-- `clerk.md` - Clerk authentication setup, API access, DNS requirements
-- `cloudflare.md` - Cloudflare DNS API access, zone IDs, tokens
-- `vercel.md` - Vercel deployment access
-- `coolify.md` - Coolify server access
+---
 
 ## API Endpoints
 
@@ -79,70 +90,226 @@ Files:
 |----------|--------|-------------|
 | `/health` | GET | Health check |
 
-### Query Endpoints (Auth Required)
+---
+
+### Master Query (Admin Key Only)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/v1/tables` | GET | List all tables |
-| `/api/v1/schema/{table}` | GET | Get table schema |
-| `/api/v1/query` | POST | Execute SQL query (SELECT/WITH only) |
+| `/api/v1/admin/query` | POST | Execute any SQL - DuckDB resolves file paths from SQL |
 
-### Admin File Management (Auth Required)
+**SQL Syntax Examples:**
+
+```sql
+-- Query DuckDB file
+SELECT * FROM '/data/myfile.duckdb'.table_name LIMIT 100
+
+-- Query Parquet file
+SELECT * FROM read_parquet('/data/file.parquet') LIMIT 100
+
+-- Cross-file join
+SELECT a.*, b.*
+FROM '/data/db1.duckdb'.users a
+JOIN read_parquet('/data/orders.parquet') b ON a.id = b.user_id
+
+-- Aggregations across files
+SELECT COUNT(*) FROM '/data/analytics.duckdb'.events
+WHERE event_date > '2024-01-01'
+```
+
+**Request:**
+```json
+{
+  "sql": "SELECT * FROM '/data/file.duckdb'.table_name LIMIT 10",
+  "limit": 1000
+}
+```
+
+**Response:**
+```json
+{
+  "columns": ["id", "name", "value"],
+  "rows": [[1, "test", 100], ...],
+  "row_count": 10,
+  "truncated": false
+}
+```
+
+---
+
+### Per-file Query (File Token)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/v1/admin/files` | GET | List all DuckDB files |
-| `/api/v1/admin/files/{filename}/preview` | GET | Preview file data |
-| `/api/v1/admin/files/upload` | POST | Upload new file |
+| `/api/v1/files/{filename}/query` | POST | Query specific file with permission validation |
+
+- Token must be valid for the specified file
+- SQL validated against token's permission level
+- No file path syntax needed - queries run against the bound file
+
+**Request:**
+```json
+{
+  "sql": "SELECT * FROM my_table LIMIT 100",
+  "limit": 1000
+}
+```
+
+---
+
+### Admin File Management (Admin Key)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/admin/files` | GET | List all files with metadata |
+| `/api/v1/admin/files/{filename}/preview` | GET | Preview file contents (first 100 rows per table) |
+| `/api/v1/admin/files/upload` | POST | Upload new file (.duckdb or .parquet) |
 | `/api/v1/admin/files/{filename}` | DELETE | Delete file |
 | `/api/v1/admin/files/{filename}/rename` | PUT | Rename file |
 | `/api/v1/admin/files/{filename}/download` | GET | Download file |
+| `/api/v1/admin/files/{filename}/refresh-metadata` | POST | Refresh cached metadata |
 
-### Table Operations (Auth Required)
+**List Files Response:**
+```json
+{
+  "files": [
+    {
+      "name": "data.duckdb",
+      "size_bytes": 1048576,
+      "size_mb": 1.0,
+      "row_count": 50000,
+      "file_type": "duckdb",
+      "tables": ["users", "orders"],
+      "table_row_counts": {"users": 1000, "orders": 49000},
+      "updated_at": "2026-01-02T10:00:00",
+      "share_token": null
+    },
+    {
+      "name": "analytics.parquet",
+      "size_bytes": 2097152,
+      "size_mb": 2.0,
+      "row_count": 100000,
+      "file_type": "parquet",
+      "tables": ["_data"],
+      "columns": ["event_id", "event_type", "timestamp"],
+      "updated_at": "2026-01-02T10:00:00",
+      "share_token": "abc123"
+    }
+  ],
+  "count": 2
+}
+```
+
+---
+
+### Table Operations (Admin Key, DuckDB Only)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/v1/admin/files/{filename}/tables/{table}/rename` | PUT | Rename table |
 | `/api/v1/admin/files/{filename}/tables/{table}` | DELETE | Delete table |
 
+---
+
 ### File Sharing
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/api/v1/admin/files/{filename}/share` | POST | Yes | Generate share link |
-| `/api/v1/admin/files/{filename}/share` | DELETE | Yes | Remove share link |
-| `/s/{token}` | GET | No | Download via share token |
+| `/api/v1/admin/files/{filename}/share` | POST | Admin | Generate share link |
+| `/api/v1/admin/files/{filename}/share` | DELETE | Admin | Remove share link |
+| `/s/{token}` | GET | None | Public download via share token |
+
+---
+
+### Token Management (Admin Key)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/tokens` | POST | Create new per-file token |
+| `/api/v1/tokens` | GET | List all tokens |
+| `/api/v1/tokens/{id}` | GET | Get token details |
+| `/api/v1/tokens/{id}` | DELETE | Delete token |
+| `/api/v1/tokens/{id}/rotate` | POST | Rotate token (generates new value) |
+
+**Create Token Request:**
+```json
+{
+  "name": "My App Token",
+  "file_name": "mydata.duckdb",
+  "permissions": "read",
+  "expires_days": 30
+}
+```
+
+**Create Token Response (token shown only once):**
+```json
+{
+  "id": 1,
+  "name": "My App Token",
+  "token": "abc123...",
+  "file_name": "mydata.duckdb",
+  "permissions": "read",
+  "expires_at": "2026-02-01T10:00:00"
+}
+```
+
+---
 
 ### Direct Upload (For Large Files)
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/api/v1/admin/upload-token` | POST | Yes | Generate upload token (10-min expiry) |
-| `/api/v1/admin/upload-direct/{token}` | POST | No | Upload using token |
+| `/api/v1/admin/upload-token` | POST | Admin | Generate upload token (10-min expiry) |
+| `/api/v1/admin/upload-direct/{token}` | POST | Token | Upload using token |
 
-## Query Safety
+Use `https://duckdb-upload.tigzig.com` for direct uploads to bypass Cloudflare's 100MB limit.
 
-Only allows read operations:
-- `SELECT` statements
-- `WITH` (CTE) statements
+---
 
-Blocks dangerous keywords:
-- INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE
+## Supported File Types
+
+| Extension | Type | Description |
+|-----------|------|-------------|
+| `.duckdb` | DuckDB | Database files with multiple tables |
+| `.parquet` | Parquet | Single-dataset columnar files |
+
+For Parquet files:
+- Tables list contains `["_data"]` (pseudo-table name)
+- Additional `columns` field lists column names
+- Preview shows data under `_data` key
+
+---
+
+## Query Safety (Per-file Tokens)
+
+Permission levels control allowed SQL operations:
+
+**Read Permission:**
+- Only `SELECT` and `WITH` (CTE) statements
+
+**Write Permission:**
+- `SELECT`, `WITH`, `INSERT`, `UPDATE`
+
+**Admin Permission:**
+- All operations except `DROP DATABASE`
 
 Row limit: 10,000 (configurable via `MAX_ROWS`)
+
+---
 
 ## Environment Variables
 
 ```bash
-API_KEY=your-secure-api-key       # REQUIRED
-DATA_PATH=./data/cricket.duckdb   # Default database file
-DATA_DIR=./data                   # Directory for all DB files
-MAX_UPLOAD_SIZE=500000000         # 500MB default
+API_KEY=your-master-api-key       # REQUIRED - Master admin key
+DATA_DIR=./data                   # Directory for all files
+MAX_UPLOAD_SIZE=524288000         # 500MB default
 RATE_LIMIT=100/hour               # Rate limiting
 MAX_ROWS=10000                    # Max rows per query
 LOG_LEVEL=INFO
 CORS_ORIGINS=*
 ```
+
+---
 
 ## Rate Limiting
 
@@ -150,14 +317,27 @@ CORS_ORIGINS=*
 - Uses `slowapi` library
 - Returns 429 when exceeded
 
+---
+
 ## Metadata Caching
 
 File metadata cached in `data/file_metadata.json`:
 - File size, modification time
-- Tables and their schemas
+- Tables and their schemas (or columns for Parquet)
 - Row counts per table
 
 Auto-rebuilds on startup if missing or outdated.
+
+---
+
+## Token Storage
+
+Per-file tokens stored in `data/tokens.db` (SQLite):
+- Tokens bcrypt-hashed (never stored plain)
+- Tracks: name, file_name, permissions, created_at, last_used_at, expires_at, enabled
+- Raw token only returned on creation/rotation
+
+---
 
 ## Deployment (Coolify)
 
@@ -169,7 +349,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 180
 ```
 
 **Required Environment Variables:**
-- `API_KEY` - Authentication key
+- `API_KEY` - Master authentication key
 
 **To redeploy:**
 ```bash
@@ -178,50 +358,53 @@ curl -s -k -X GET "https://hosting.tigzig.com/api/v1/deploy?uuid=b8ogo4k4ckwcckw
   -H "Accept: application/json"
 ```
 
+---
+
 ## Adding New Endpoints
 
-When adding new endpoints:
-
-1. **Protected endpoints** - Use `Depends(verify_api_key)`:
+**Protected endpoints (Admin Key):**
 ```python
-@app.get("/api/v1/new-endpoint")
-async def new_endpoint(request: Request, _: None = Depends(verify_api_key)):
+@app.get("/api/v1/admin/new-endpoint", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def new_admin_endpoint(request: Request):
     pass
 ```
 
-2. **Public endpoints** - No dependency:
+**Protected endpoints (File Token):**
+```python
+@app.get("/api/v1/files/{filename}/new-endpoint", dependencies=[Depends(verify_file_token)])
+async def new_file_endpoint(filename: str, request: Request):
+    pass
+```
+
+**Public endpoints:**
 ```python
 @app.get("/public-endpoint")
 async def public_endpoint():
     pass
 ```
 
-3. **Update CLIENTS.md** if endpoint is used by a client app
+---
 
 ## Error Codes
 
 | Code | Meaning |
 |------|---------|
-| 401 | Missing Authorization header |
-| 403 | Invalid API key |
 | 400 | Invalid SQL / bad request |
+| 401 | Missing Authorization header |
+| 403 | Invalid API key or token / insufficient permissions |
 | 404 | Table/file not found |
 | 413 | File too large |
 | 429 | Rate limit exceeded |
 | 500 | Server error |
 
-## Sample Database Schema (cricket.duckdb)
+---
 
-### `ball_by_ball` (~4.4M rows)
-Every ball in cricket matches:
-- `match_id`, `start_date`, `match_type`
-- `venue`, `batting_team`, `bowling_team`, `innings`
-- `striker`, `non_striker`, `bowler`
-- `runs_off_bat`, `extras`, `wides`, `noballs`
-- `wicket_type`, `player_dismissed`
+## Client Apps
 
-### `match_info` (~8,762 rows)
-Match metadata:
-- `match_id`, `match_type`, `start_date`, `venue`
-- `team1`, `team2`, `winner`
-- `winner_runs`, `winner_wickets`
+See [CLIENTS.md](./CLIENTS.md) for apps connecting to this backend.
+
+| App | Auth Method |
+|-----|-------------|
+| DuckDB Admin | Master key via Vercel proxy |
+| Client apps | Per-file tokens |
