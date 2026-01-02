@@ -6,6 +6,7 @@ Includes admin endpoints for file management.
 
 from fastapi import FastAPI, HTTPException, Request, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from tigzig_api_monitor import APIMonitorMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from typing import Optional, List, Any
@@ -134,6 +135,13 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
+)
+
+# API Monitor middleware for centralized logging
+app.add_middleware(
+    APIMonitorMiddleware,
+    app_name="DUCKDB_BACKEND",
+    include_prefixes=("/api/v1/", "/s/"),  # Log API and share endpoints
 )
 
 # DuckDB connection (opened once at startup)
