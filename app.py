@@ -176,17 +176,55 @@ def get_duckdb_table_info(filepath: str) -> tuple[List[str], dict, int]:
         logger.error(f"Failed to get table info from {filepath}: {e}")
         return [], {}, -1
 
+
+def get_parquet_info(filepath: str) -> tuple[List[str], int]:
+    """Get column names and row count from a Parquet file."""
+    try:
+        conn = duckdb.connect(":memory:")
+        # Get row count
+        count_result = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{filepath}')").fetchone()
+        row_count = count_result[0] if count_result else 0
+        # Get column names
+        conn.execute(f"SELECT * FROM read_parquet('{filepath}') LIMIT 0")
+        columns = [desc[0] for desc in conn.description]
+        conn.close()
+        return columns, row_count
+    except Exception as e:
+        logger.error(f"Failed to get parquet info from {filepath}: {e}")
+        return [], -1
+
+
 def rebuild_metadata_for_file(filename: str, filepath: str) -> dict:
-    """Build metadata entry for a single file."""
+    """Build metadata entry for a single file (DuckDB or Parquet)."""
     size_bytes = os.path.getsize(filepath)
-    tables, table_row_counts, total_rows = get_duckdb_table_info(filepath)
-    return {
-        "size_bytes": size_bytes,
-        "row_count": total_rows,
-        "tables": tables,
-        "table_row_counts": table_row_counts,
-        "updated_at": datetime.now().isoformat()
-    }
+
+    if filename.endswith(".parquet"):
+        columns, row_count = get_parquet_info(filepath)
+        return {
+            "size_bytes": size_bytes,
+            "row_count": row_count,
+            "file_type": "parquet",
+            "columns": columns,
+            "tables": [],  # Parquet files don't have tables
+            "table_row_counts": {},
+            "updated_at": datetime.now().isoformat()
+        }
+    else:
+        # DuckDB file
+        tables, table_row_counts, total_rows = get_duckdb_table_info(filepath)
+        return {
+            "size_bytes": size_bytes,
+            "row_count": total_rows,
+            "file_type": "duckdb",
+            "tables": tables,
+            "table_row_counts": table_row_counts,
+            "updated_at": datetime.now().isoformat()
+        }
+
+
+# Supported file extensions
+SUPPORTED_EXTENSIONS = (".duckdb", ".parquet")
+
 
 def ensure_metadata_exists():
     """Ensure metadata file exists and is up to date with actual files."""
@@ -194,13 +232,14 @@ def ensure_metadata_exists():
     files_on_disk = set()
     needs_save = False
 
-    # Scan directory for .duckdb files
+    # Scan directory for .duckdb and .parquet files
     for f in os.listdir(DATA_DIR):
-        if f.endswith(".duckdb"):
+        if f.endswith(SUPPORTED_EXTENSIONS):
             files_on_disk.add(f)
             filepath = os.path.join(DATA_DIR, f)
             # Rebuild if file not in metadata OR if table_row_counts is missing (backward compat)
-            if f not in metadata or "table_row_counts" not in metadata[f]:
+            # Or if file_type is missing (new field for parquet support)
+            if f not in metadata or "table_row_counts" not in metadata[f] or "file_type" not in metadata[f]:
                 logger.info(f"Building/updating metadata for file: {f}")
                 metadata[f] = rebuild_metadata_for_file(f, filepath)
                 needs_save = True
@@ -523,79 +562,35 @@ async def health_check():
     """Health check endpoint for load balancers and monitoring."""
     return {"status": "ok", "version": VERSION}
 
-# ============== Existing query endpoints ==============
+# ============== Master Query Endpoint (Admin Key) ==============
 
-@app.get("/api/v1/tables", dependencies=[Depends(verify_api_key)])
+@app.post("/api/v1/admin/query", dependencies=[Depends(verify_api_key)])
 @limiter.limit(RATE_LIMIT)
-async def list_tables(request: Request):
-    """List all available tables in the database."""
-    if not db_connection:
-        raise HTTPException(status_code=503, detail="Database not connected")
-    try:
-        result = db_connection.execute("SHOW TABLES").fetchall()
-        tables = [row[0] for row in result]
-        return {"tables": tables}
-    except Exception as e:
-        logger.error(f"Error listing tables: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def admin_query(query: QueryRequest, request: Request):
+    """
+    Execute any SQL query with unrestricted access.
 
-@app.get("/api/v1/schema/{table_name}", dependencies=[Depends(verify_api_key)])
-@limiter.limit(RATE_LIMIT)
-async def get_schema(table_name: str, request: Request):
-    """Get schema for a specific table."""
-    if not db_connection:
-        raise HTTPException(status_code=503, detail="Database not connected")
-    try:
-        tables = [row[0] for row in db_connection.execute("SHOW TABLES").fetchall()]
-        if table_name not in tables:
-            raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
+    Uses the master admin API key. DuckDB resolves file paths from the SQL itself.
 
-        result = db_connection.execute(f"DESCRIBE {table_name}").fetchall()
-        schema = [
-            {
-                "column_name": row[0],
-                "column_type": row[1],
-                "nullable": row[2] == "YES"
-            }
-            for row in result
-        ]
-        return {"table": table_name, "schema": schema}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting schema for {table_name}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/query", dependencies=[Depends(verify_api_key)])
-@limiter.limit(RATE_LIMIT)
-async def execute_query(query: QueryRequest, request: Request):
-    """Execute a read-only SQL query."""
-    if not db_connection:
-        raise HTTPException(status_code=503, detail="Database not connected")
-
+    Examples:
+    - Query a specific file: SELECT * FROM '/data/myfile.duckdb'.table_name
+    - Query parquet: SELECT * FROM read_parquet('/data/file.parquet')
+    - Cross-file join: SELECT * FROM '/data/a.duckdb'.t1 JOIN read_parquet('/data/b.parquet') ON ...
+    - Query main DB (DATA_PATH): SELECT * FROM table_name
+    """
     sql = query.sql.strip()
 
-    # Basic SQL injection prevention - only allow SELECT/WITH statements
-    sql_lower = sql.lower()
-    if not (sql_lower.startswith("select") or sql_lower.startswith("with")):
-        raise HTTPException(
-            status_code=400,
-            detail="Only SELECT and WITH queries are allowed"
-        )
-
-    # Disallow dangerous keywords
-    dangerous = ["insert", "update", "delete", "drop", "create", "alter", "truncate", "exec", "execute"]
-    for keyword in dangerous:
-        if keyword in sql_lower:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Query contains forbidden keyword: {keyword}"
-            )
+    if not sql:
+        raise HTTPException(status_code=400, detail="SQL query is required")
 
     try:
+        # Create a fresh in-memory connection for each query
+        # This allows DuckDB to resolve file paths from the SQL
+        conn = duckdb.connect(":memory:")
+
         row_limit = min(query.limit or MAX_ROWS, MAX_ROWS)
-        result = db_connection.execute(sql).fetchmany(row_limit + 1)
-        columns = [desc[0] for desc in db_connection.description]
+        result = conn.execute(sql).fetchmany(row_limit + 1)
+        columns = [desc[0] for desc in conn.description]
 
         truncated = len(result) > row_limit
         if truncated:
@@ -610,6 +605,9 @@ async def execute_query(query: QueryRequest, request: Request):
                 for val in row
             ])
 
+        conn.close()
+
+        logger.info(f"Admin query executed: {sql[:100]}... ({len(rows)} rows)")
         return {
             "columns": columns,
             "rows": rows,
@@ -618,10 +616,10 @@ async def execute_query(query: QueryRequest, request: Request):
         }
 
     except duckdb.Error as e:
-        logger.error(f"DuckDB error: {e}")
+        logger.error(f"DuckDB error in admin query: {e}")
         raise HTTPException(status_code=400, detail=f"Query error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error executing query: {e}")
+        logger.error(f"Error in admin query: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============== Admin file management endpoints ==============
@@ -629,22 +627,27 @@ async def execute_query(query: QueryRequest, request: Request):
 @app.get("/api/v1/admin/files", dependencies=[Depends(verify_api_key)])
 @limiter.limit(RATE_LIMIT)
 async def list_files(request: Request):
-    """List all DuckDB files with their metadata."""
+    """List all DuckDB and Parquet files with their metadata."""
     try:
         metadata = ensure_metadata_exists()
         files = []
         for filename, info in metadata.items():
             share_token = get_share_token_for_file(filename)
-            files.append({
+            file_info = {
                 "name": filename,
                 "size_bytes": info.get("size_bytes", 0),
                 "size_mb": round(info.get("size_bytes", 0) / (1024 * 1024), 2),
                 "row_count": info.get("row_count", -1),
+                "file_type": info.get("file_type", "duckdb"),
                 "tables": info.get("tables", []),
                 "table_row_counts": info.get("table_row_counts", {}),
                 "updated_at": info.get("updated_at", ""),
                 "share_token": share_token
-            })
+            }
+            # Add columns for parquet files
+            if info.get("file_type") == "parquet":
+                file_info["columns"] = info.get("columns", [])
+            files.append(file_info)
         # Sort by name
         files.sort(key=lambda x: x["name"])
         return {"files": files, "count": len(files)}
@@ -655,7 +658,7 @@ async def list_files(request: Request):
 @app.get("/api/v1/admin/files/{filename}/preview", dependencies=[Depends(verify_api_key)])
 @limiter.limit(RATE_LIMIT)
 async def preview_file(filename: str, request: Request, limit: int = 10):
-    """Get sample rows from a DuckDB file."""
+    """Get sample rows from a DuckDB or Parquet file."""
     # Security: prevent path traversal
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
@@ -665,12 +668,10 @@ async def preview_file(filename: str, request: Request, limit: int = 10):
         raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
 
     try:
-        conn = duckdb.connect(filepath, read_only=True)
-        tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
-
-        preview_data = {}
-        for table in tables:
-            result = conn.execute(f"SELECT * FROM {table} LIMIT {limit}").fetchall()
+        # Handle parquet files differently
+        if filename.endswith(".parquet"):
+            conn = duckdb.connect(":memory:")
+            result = conn.execute(f"SELECT * FROM read_parquet('{filepath}') LIMIT {limit}").fetchall()
             columns = [desc[0] for desc in conn.description]
             rows = []
             for row in result:
@@ -680,14 +681,44 @@ async def preview_file(filename: str, request: Request, limit: int = 10):
                     val
                     for val in row
                 ])
-            preview_data[table] = {
-                "columns": columns,
-                "rows": rows,
-                "row_count": len(rows)
+            conn.close()
+            # For parquet, we use "_data" as the pseudo-table name
+            return {
+                "filename": filename,
+                "file_type": "parquet",
+                "tables": {
+                    "_data": {
+                        "columns": columns,
+                        "rows": rows,
+                        "row_count": len(rows)
+                    }
+                }
             }
+        else:
+            # DuckDB file
+            conn = duckdb.connect(filepath, read_only=True)
+            tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
 
-        conn.close()
-        return {"filename": filename, "tables": preview_data}
+            preview_data = {}
+            for table in tables:
+                result = conn.execute(f"SELECT * FROM {table} LIMIT {limit}").fetchall()
+                columns = [desc[0] for desc in conn.description]
+                rows = []
+                for row in result:
+                    rows.append([
+                        val.isoformat() if isinstance(val, (date, datetime)) else
+                        float(val) if isinstance(val, Decimal) else
+                        val
+                        for val in row
+                    ])
+                preview_data[table] = {
+                    "columns": columns,
+                    "rows": rows,
+                    "row_count": len(rows)
+                }
+
+            conn.close()
+            return {"filename": filename, "file_type": "duckdb", "tables": preview_data}
     except Exception as e:
         logger.error(f"Error previewing file {filename}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -699,17 +730,24 @@ async def upload_file(
     file: UploadFile = File(...),
     custom_name: Optional[str] = Form(None)
 ):
-    """Upload a new DuckDB file."""
+    """Upload a new DuckDB or Parquet file."""
     # Determine filename
     filename = custom_name if custom_name else file.filename
     if not filename:
         raise HTTPException(status_code=400, detail="Filename required")
 
-    # Security: ensure .duckdb extension and no path traversal
+    # Security: prevent path traversal
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
-    if not filename.endswith(".duckdb"):
+
+    # Determine file type and ensure proper extension
+    is_parquet = filename.endswith(".parquet")
+    is_duckdb = filename.endswith(".duckdb")
+
+    if not is_parquet and not is_duckdb:
+        # Default to duckdb if no extension
         filename = filename + ".duckdb"
+        is_duckdb = True
 
     filepath = os.path.join(DATA_DIR, filename)
 
@@ -731,14 +769,22 @@ async def upload_file(
                     )
                 f.write(chunk)
 
-        # Validate it is a valid DuckDB file
+        # Validate the file based on type
         try:
-            test_conn = duckdb.connect(filepath, read_only=True)
-            test_conn.execute("SHOW TABLES")
-            test_conn.close()
+            if is_parquet:
+                # Validate parquet file
+                test_conn = duckdb.connect(":memory:")
+                test_conn.execute(f"SELECT * FROM read_parquet('{filepath}') LIMIT 1")
+                test_conn.close()
+            else:
+                # Validate DuckDB file
+                test_conn = duckdb.connect(filepath, read_only=True)
+                test_conn.execute("SHOW TABLES")
+                test_conn.close()
         except Exception as e:
             os.remove(filepath)
-            raise HTTPException(status_code=400, detail=f"Invalid DuckDB file: {str(e)}")
+            file_type = "Parquet" if is_parquet else "DuckDB"
+            raise HTTPException(status_code=400, detail=f"Invalid {file_type} file: {str(e)}")
 
         # Update metadata
         metadata = load_metadata()
@@ -1007,6 +1053,7 @@ async def generate_upload_token(token_req: UploadTokenRequest, request: Request)
     """
     Generate a temporary upload token for direct file upload.
     This allows bypassing the Vercel proxy for large files.
+    Supports both DuckDB and Parquet files.
     """
     cleanup_expired_tokens()
 
@@ -1016,8 +1063,9 @@ async def generate_upload_token(token_req: UploadTokenRequest, request: Request)
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    # Ensure .duckdb extension
-    if not filename.endswith(".duckdb"):
+    # Determine file type and ensure proper extension
+    if not filename.endswith(SUPPORTED_EXTENSIONS):
+        # Default to duckdb if no supported extension
         filename = filename + ".duckdb"
 
     # Check file size limit
@@ -1121,15 +1169,24 @@ async def upload_direct(
                     )
                 f.write(chunk)
 
-        # Validate it is a valid DuckDB file
+        # Validate the file based on type
+        is_parquet = filename.endswith(".parquet")
         try:
-            test_conn = duckdb.connect(filepath, read_only=True)
-            test_conn.execute("SHOW TABLES")
-            test_conn.close()
+            if is_parquet:
+                # Validate parquet file
+                test_conn = duckdb.connect(":memory:")
+                test_conn.execute(f"SELECT * FROM read_parquet('{filepath}') LIMIT 1")
+                test_conn.close()
+            else:
+                # Validate DuckDB file
+                test_conn = duckdb.connect(filepath, read_only=True)
+                test_conn.execute("SHOW TABLES")
+                test_conn.close()
         except Exception as e:
             os.remove(filepath)
             del UPLOAD_TOKENS[token]
-            return cors_json_response({"detail": f"Invalid DuckDB file: {str(e)}"}, 400)
+            file_type = "Parquet" if is_parquet else "DuckDB"
+            return cors_json_response({"detail": f"Invalid {file_type} file: {str(e)}"}, 400)
 
         # Update metadata
         metadata = load_metadata()
