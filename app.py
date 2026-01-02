@@ -15,7 +15,9 @@ import logging
 import secrets
 import json
 import shutil
-from datetime import date, datetime, time
+import sqlite3
+import bcrypt
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -55,6 +57,9 @@ VERSION = "1.2.3"
 
 # Share tokens file for persistent storage
 SHARE_TOKENS_FILE = os.path.join(DATA_DIR, "share_tokens.json")
+
+# API tokens SQLite database
+TOKENS_DB = os.path.join(DATA_DIR, "tokens.db")
 
 # Logging setup
 logging.basicConfig(
@@ -246,6 +251,219 @@ def get_file_for_share_token(token: str) -> Optional[str]:
         return tokens[token].get("filename")
     return None
 
+# ============== API Token helpers (SQLite + bcrypt) ==============
+
+def init_tokens_db():
+    """Initialize the SQLite database for API tokens."""
+    conn = sqlite3.connect(TOKENS_DB)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            permissions TEXT DEFAULT 'read',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_used_at TIMESTAMP,
+            expires_at TIMESTAMP,
+            enabled INTEGER DEFAULT 1
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("API tokens database initialized")
+
+def generate_api_token() -> str:
+    """Generate a random API token."""
+    return secrets.token_urlsafe(32)
+
+def hash_api_token(token: str) -> str:
+    """Hash a token using bcrypt."""
+    return bcrypt.hashpw(token.encode(), bcrypt.gensalt()).decode()
+
+def verify_api_token(token: str, token_hash: str) -> bool:
+    """Verify a token against its hash."""
+    try:
+        return bcrypt.checkpw(token.encode(), token_hash.encode())
+    except Exception:
+        return False
+
+def get_tokens_db_connection():
+    """Get a connection to the tokens database."""
+    conn = sqlite3.connect(TOKENS_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def create_file_token(name: str, file_name: str, permissions: str = 'read', expires_days: Optional[int] = None) -> dict:
+    """Create a new API token for a file."""
+    raw_token = generate_api_token()
+    token_hash = hash_api_token(raw_token)
+
+    expires_at = None
+    if expires_days:
+        expires_at = (datetime.now() + timedelta(days=expires_days)).isoformat()
+
+    conn = get_tokens_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO api_tokens (name, token_hash, file_name, permissions, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (name, token_hash, file_name, permissions, expires_at))
+    token_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    return {
+        "id": token_id,
+        "name": name,
+        "token": raw_token,  # Only returned on creation
+        "file_name": file_name,
+        "permissions": permissions,
+        "expires_at": expires_at
+    }
+
+def list_file_tokens() -> List[dict]:
+    """List all API tokens (without the actual token values)."""
+    conn = get_tokens_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, name, file_name, permissions, created_at, last_used_at, expires_at, enabled
+        FROM api_tokens
+        ORDER BY created_at DESC
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+def get_token_by_id(token_id: int) -> Optional[dict]:
+    """Get token info by ID (without the hash)."""
+    conn = get_tokens_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, name, file_name, permissions, created_at, last_used_at, expires_at, enabled
+        FROM api_tokens WHERE id = ?
+    ''', (token_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def delete_file_token(token_id: int) -> bool:
+    """Delete an API token."""
+    conn = get_tokens_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM api_tokens WHERE id = ?', (token_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+def rotate_file_token(token_id: int) -> Optional[dict]:
+    """Generate a new token value for an existing token entry."""
+    conn = get_tokens_db_connection()
+    cursor = conn.cursor()
+
+    # Check if token exists
+    cursor.execute('SELECT * FROM api_tokens WHERE id = ?', (token_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    # Generate new token
+    raw_token = generate_api_token()
+    token_hash = hash_api_token(raw_token)
+
+    cursor.execute('''
+        UPDATE api_tokens SET token_hash = ? WHERE id = ?
+    ''', (token_hash, token_id))
+    conn.commit()
+
+    # Get updated record
+    cursor.execute('''
+        SELECT id, name, file_name, permissions, created_at, last_used_at, expires_at, enabled
+        FROM api_tokens WHERE id = ?
+    ''', (token_id,))
+    updated_row = cursor.fetchone()
+    conn.close()
+
+    result = dict(updated_row)
+    result["token"] = raw_token  # Only returned on rotation
+    return result
+
+def verify_file_token(raw_token: str, file_name: str) -> Optional[dict]:
+    """
+    Verify a token for a specific file.
+    Returns token info if valid, None otherwise.
+    """
+    conn = get_tokens_db_connection()
+    cursor = conn.cursor()
+
+    # Get all tokens for this file
+    cursor.execute('''
+        SELECT id, name, token_hash, file_name, permissions, expires_at, enabled
+        FROM api_tokens WHERE file_name = ? AND enabled = 1
+    ''', (file_name,))
+    rows = cursor.fetchall()
+
+    for row in rows:
+        # Check expiration
+        if row['expires_at']:
+            expires = datetime.fromisoformat(row['expires_at'])
+            if datetime.now() > expires:
+                continue
+
+        # Verify token hash
+        if verify_api_token(raw_token, row['token_hash']):
+            # Update last_used_at
+            cursor.execute('''
+                UPDATE api_tokens SET last_used_at = ? WHERE id = ?
+            ''', (datetime.now().isoformat(), row['id']))
+            conn.commit()
+            conn.close()
+
+            return {
+                "id": row['id'],
+                "name": row['name'],
+                "file_name": row['file_name'],
+                "permissions": row['permissions']
+            }
+
+    conn.close()
+    return None
+
+# ============== SQL Permission Validation ==============
+
+# Keywords blocked for each permission level
+READ_BLOCKED_KEYWORDS = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE', 'TRUNCATE', 'EXEC', 'EXECUTE']
+WRITE_BLOCKED_KEYWORDS = ['DELETE', 'DROP', 'ALTER', 'CREATE', 'TRUNCATE']
+ADMIN_BLOCKED_KEYWORDS = ['DROP DATABASE']
+
+def validate_sql_for_permission(sql: str, permission: str) -> tuple[bool, Optional[str]]:
+    """
+    Validate SQL query against permission level.
+    Returns (is_valid, error_message).
+    """
+    sql_upper = sql.upper()
+
+    if permission == 'read':
+        for kw in READ_BLOCKED_KEYWORDS:
+            if kw in sql_upper:
+                return False, f"Read permission does not allow {kw} operations"
+    elif permission == 'write':
+        for kw in WRITE_BLOCKED_KEYWORDS:
+            if kw in sql_upper:
+                return False, f"Write permission does not allow {kw} operations"
+    elif permission == 'admin':
+        for kw in ADMIN_BLOCKED_KEYWORDS:
+            if kw in sql_upper:
+                return False, f"Operation not allowed: {kw}"
+    else:
+        return False, f"Unknown permission level: {permission}"
+
+    return True, None
+
 # ============== Startup/Shutdown ==============
 
 @app.on_event("startup")
@@ -266,6 +484,9 @@ async def startup():
     # Build/update metadata on startup
     ensure_metadata_exists()
     logger.info("Metadata initialized")
+
+    # Initialize API tokens database
+    init_tokens_db()
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -1033,6 +1254,189 @@ async def download_shared_file(token: str, request: Request):
         media_type="application/octet-stream",
         filename=filename
     )
+
+
+# ============== API Token Management Endpoints ==============
+
+class CreateTokenRequest(BaseModel):
+    name: str
+    file_name: str
+    permissions: str = 'read'  # 'read', 'write', 'admin'
+    expires_days: Optional[int] = None
+
+
+@app.post("/api/v1/tokens", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def create_token(token_req: CreateTokenRequest, request: Request):
+    """
+    Create a new API token for a specific file.
+    The raw token is only returned once - store it securely!
+    """
+    # Validate permissions
+    if token_req.permissions not in ['read', 'write', 'admin']:
+        raise HTTPException(status_code=400, detail="Invalid permissions. Use 'read', 'write', or 'admin'")
+
+    # Validate file exists
+    filepath = os.path.join(DATA_DIR, token_req.file_name)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail=f"File '{token_req.file_name}' not found")
+
+    try:
+        result = create_file_token(
+            name=token_req.name,
+            file_name=token_req.file_name,
+            permissions=token_req.permissions,
+            expires_days=token_req.expires_days
+        )
+        logger.info(f"Created API token '{token_req.name}' for file '{token_req.file_name}'")
+        return result
+    except Exception as e:
+        logger.error(f"Error creating token: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/tokens", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def list_tokens(request: Request):
+    """
+    List all API tokens (without revealing the actual token values).
+    """
+    try:
+        tokens = list_file_tokens()
+        return {"tokens": tokens, "count": len(tokens)}
+    except Exception as e:
+        logger.error(f"Error listing tokens: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/tokens/{token_id}", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def get_token(token_id: int, request: Request):
+    """
+    Get details for a specific token (without the actual token value).
+    """
+    token = get_token_by_id(token_id)
+    if not token:
+        raise HTTPException(status_code=404, detail=f"Token with ID {token_id} not found")
+    return token
+
+
+@app.delete("/api/v1/tokens/{token_id}", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def delete_token(token_id: int, request: Request):
+    """
+    Delete an API token.
+    """
+    deleted = delete_file_token(token_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Token with ID {token_id} not found")
+    logger.info(f"Deleted API token with ID {token_id}")
+    return {"message": f"Token {token_id} deleted successfully"}
+
+
+@app.post("/api/v1/tokens/{token_id}/rotate", dependencies=[Depends(verify_api_key)])
+@limiter.limit(RATE_LIMIT)
+async def rotate_token(token_id: int, request: Request):
+    """
+    Rotate an API token - generates a new token value while keeping the same metadata.
+    The new raw token is only returned once - store it securely!
+    """
+    result = rotate_file_token(token_id)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Token with ID {token_id} not found")
+    logger.info(f"Rotated API token with ID {token_id}")
+    return result
+
+
+# ============== Per-File Query Endpoint (Token Auth) ==============
+
+class FileQueryRequest(BaseModel):
+    sql: str
+    limit: Optional[int] = None
+
+
+@app.post("/api/v1/files/{filename}/query")
+@limiter.limit(RATE_LIMIT)
+async def query_file(filename: str, query: FileQueryRequest, request: Request):
+    """
+    Execute a SQL query against a specific DuckDB file.
+    Requires a file-specific API token (not the admin API key).
+    Permission level determines what SQL operations are allowed.
+    """
+    # Security: prevent path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    # Get token from Authorization header
+    auth = request.headers.get("Authorization")
+    if not auth:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    scheme, _, raw_token = auth.partition(" ")
+    if scheme.lower() != "bearer" or not raw_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid auth scheme, use 'Bearer <token>'",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Verify token for this file
+    token_info = verify_file_token(raw_token, filename)
+    if not token_info:
+        raise HTTPException(status_code=401, detail="Invalid or expired token for this file")
+
+    # Validate SQL against permission level
+    is_valid, error_msg = validate_sql_for_permission(query.sql, token_info['permissions'])
+    if not is_valid:
+        raise HTTPException(status_code=403, detail=error_msg)
+
+    # Check file exists
+    filepath = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
+
+    try:
+        # Open connection to the specific file
+        conn = duckdb.connect(filepath, read_only=(token_info['permissions'] == 'read'))
+
+        row_limit = min(query.limit or MAX_ROWS, MAX_ROWS)
+        result = conn.execute(query.sql).fetchmany(row_limit + 1)
+        columns = [desc[0] for desc in conn.description]
+
+        truncated = len(result) > row_limit
+        if truncated:
+            result = result[:row_limit]
+
+        rows = []
+        for row in result:
+            rows.append([
+                val.isoformat() if isinstance(val, (date, datetime)) else
+                float(val) if isinstance(val, Decimal) else
+                val
+                for val in row
+            ])
+
+        conn.close()
+
+        logger.info(f"Query executed on {filename} by token '{token_info['name']}' ({len(rows)} rows)")
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": truncated,
+            "file": filename
+        }
+
+    except duckdb.Error as e:
+        logger.error(f"DuckDB error querying {filename}: {e}")
+        raise HTTPException(status_code=400, detail=f"Query error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error querying {filename}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Run with uvicorn
