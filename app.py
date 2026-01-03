@@ -49,9 +49,9 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 # Metadata file for caching file info
 METADATA_FILE = os.path.join(DATA_DIR, "file_metadata.json")
 
-# Upload token storage (in-memory, tokens expire after 10 minutes)
+# Upload token storage (in-memory, tokens expire after 60 minutes for large file uploads)
 UPLOAD_TOKENS: dict[str, dict] = {}
-UPLOAD_TOKEN_EXPIRY = 600  # 10 minutes
+UPLOAD_TOKEN_EXPIRY = 3600  # 60 minutes (for 5GB uploads on slow connections)
 
 # Version
 VERSION = "1.2.3"
